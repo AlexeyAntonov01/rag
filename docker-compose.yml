@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  qdrant_db:
+    image: qdrant/qdrant:latest
+    container_name: qdrant_db
+    ports:
+      - "6333:6333" 
+    volumes:
+      - ./qdrant_storage:/qdrant/storage 
+    networks:
+      - rag-network
+
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: rag_app
+    environment:
+      - QDRANT_HOST=qdrant_db      
+      - HF_ENDPOINT=https://hf-mirror.com
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - HF_HOME=/app/models/cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data           
+      - ./data/output_images:/usr/share/nginx/html/output_images:ro
+      - ./models:/app/models
+    depends_on:
+      - qdrant_db
+    networks:
+      - rag-network
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  hf_cache:
