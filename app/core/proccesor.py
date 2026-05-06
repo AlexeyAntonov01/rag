@@ -1,16 +1,23 @@
 import os
 from ollama import Client
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import(
+    Distance,
+    VectorParams,
+    PointStruct
+    )
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 from sentence_transformers import SentenceTransformer
-from docling.document_converter import DocumentConverter,PdfFormatOption
+from docling.document_converter import(
+    DocumentConverter,
+    PdfFormatOption
+    )
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
 import uuid
 from pathlib import Path
-
+import pymupdf
 
 
 class DocumentProcessor:
@@ -21,7 +28,6 @@ class DocumentProcessor:
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = False
         pipeline_options.do_table_structure = True
-        pipeline_options.images_scale = 2.0
         pipeline_options.generate_page_images = False 
         pdf_options = PdfFormatOption(pipeline_options=pipeline_options)
 
@@ -32,17 +38,56 @@ class DocumentProcessor:
             )    
         self.chunker = HybridChunker(tokenizer=os.getenv("EMBED_MODEL"),max_tokens=512)
         
-        self.img_dir = Path("data/output_images")
-        self.img_dir.mkdir(parents=True, exist_ok=True)
-        self.md_dir = Path("data/md_files")
 
     def getDocument(self, file_path):
 
         if not os.path.exists(file_path):
             return
-       
-        file_name = os.path.basename(file_path)
-        result = self.docs_converter.convert(file_path)
+
+        try:
+            filename = os.path.basename(file_path)
+            temp_pdf_path = f"data/temp_no_images_{filename}"
+
+            with pymupdf.open(filename) as doc:
+                
+                for num, page in enumerate(doc):
+
+                    images = page.get_image_info(hashes=True)
+                    dict_[num] = images
+
+                    try:
+
+                        for img in images:
+
+                            filename_hash = f"{filename}_{img['digest'].hex()}.png"
+                            save_path = f"extracted_images/{filename_hash}"
+
+                            pix = page.get_pixmap(clip = img['bbox'],matrix=pymupdf.Matrix(3,3))
+                            pix.save(save_path)
+                            pix = None
+
+                            page.add_redact_annot(img['bbox'], fill = (1,1,1))
+                            page.apply_redactions()
+
+                            point = (img['bbox'][0],img['bbox'][1])
+
+                            page.insert_text(point,
+                                            f'[IMAGE_REF:{filename_hash}]',
+                                            fontsize=7, 
+                                            color = (1,0,0))
+                            
+                    except Exception as page_error:
+                        print(f'Ошибка при разборе картинки на {num}:{page_error}')
+                        continue
+
+                doc.save(temp_pdf_path, garbage=4, deflate=True, clean=True)
+                
+
+        except Exception as e:
+
+            print(f"Критическая ошибка при работе с файлом {filename}: {e}")
+
+        result = self.docs_converter.convert(temp_pdf_path)
         chunks = list(self.chunker.chunk(result.document))
 
         return chunks, file_name
