@@ -4,10 +4,6 @@ qdrant_storage/
 hf_cache/
 .cache/
 
-data/
-static/
-output_images/
-md_files/
 
 __pycache__/
 *.py[cod]

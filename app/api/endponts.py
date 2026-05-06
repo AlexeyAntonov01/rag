@@ -1,14 +1,17 @@
 from fastapi import APIRouter, Request
 from app.schemas.schemas import Question
 import os
+import asyncio
 
 router = APIRouter()
+
 
 @router.post("/ask")
 async def ask_bot(request: Request, question: Question):
 
     rag = request.app.state.rag
-    answer = rag.ask(question.text)
+    loop = asyncio.get_running_loop()
+    answer = await loop.run_in_executor(None, rag.ask, question.text)
     return {"answer": answer}
 
 
@@ -40,3 +43,8 @@ async def drop_database(request: Request):
     except Exception as e:
         print(f"ОШИБКА: {str(e)}")
         return {"status": "error", "message": str(e)}
+
+
+
+    
+

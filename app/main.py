@@ -1,20 +1,12 @@
-from contextlib import asynccontextmanager
 from fastapi import FastAPI,Request
 from app.api.endponts import router
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.proccesor import RagManager 
 from fastapi.templating import Jinja2Templates
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    app.state.rag = RagManager() 
-    yield
-    del app.state.rag
+from app.core.lifespan import lifespan
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(router)
+
 
 templates = Jinja2Templates(directory="app/static")
 

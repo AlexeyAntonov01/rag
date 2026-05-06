@@ -19,10 +19,10 @@ class DocumentProcessor:
     def __init__(self):
 
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = True
+        pipeline_options.do_ocr = False
         pipeline_options.do_table_structure = True
         pipeline_options.images_scale = 2.0
-        pipeline_options.generate_page_images = True 
+        pipeline_options.generate_page_images = False 
         pdf_options = PdfFormatOption(pipeline_options=pipeline_options)
 
         self.docs_converter = DocumentConverter(
@@ -30,7 +30,7 @@ class DocumentProcessor:
                 InputFormat.PDF: pdf_options
             }
             )    
-        self.chunker = HybridChunker(tokenizer=os.getenv("EMBED_MODEL"),max_tokens=1000)
+        self.chunker = HybridChunker(tokenizer=os.getenv("EMBED_MODEL"),max_tokens=512)
         
         self.img_dir = Path("data/output_images")
         self.img_dir.mkdir(parents=True, exist_ok=True)
@@ -52,13 +52,14 @@ class VectorStore:
     # Превращает чанки в векторы -> Insert в БД
     def __init__(self):
 
+        self.collection_name = os.getenv("COLLECTION_NAME")
         qdrant_host = os.getenv("QDRANT_HOST")
         self.client = QdrantClient(host = qdrant_host,port=int(os.getenv("QDRANT_PORT")))
 
-        if not self.client.collection_exists(os.getenv("COLLECTION_NAME")):
+        if not self.client.collection_exists(self.collection_name):
 
             self.client.create_collection(
-                collection_name=os.getenv("COLLECTION_NAME"),
+                collection_name=self.collection_name,
                 vectors_config = VectorParams(size=768,distance=Distance.COSINE))
            
         self.emb_fn = SentenceTransformer(
@@ -67,7 +68,7 @@ class VectorStore:
         )
 
 
-    def chunks2Collection(self,chunks,file_name):
+    def old_chunks2Collection(self,chunks,file_name):
         
         points = []
 
@@ -88,14 +89,49 @@ class VectorStore:
                         )
                     )                                           
                     
+        self.client.upsert(collection_name = self.collection_name,points = points)
 
-        self.client.upsert(collection_name = os.getenv("COLLECTION_NAME"),points = points)
+
+    def chunks2Collection(self,chunks,file_name):
+        
+        points = []
+        batch_size = 16 
+        all_texts = [chunk.text for chunk in chunks]
+
+        for i in range(0, len(all_texts), batch_size):
+
+            batch_texts = all_texts[i:i + batch_size]
+            batch_chunks = chunks[i:i + batch_size]
+
+            batch_vectors = self.emb_fn.encode(
+                batch_texts,
+                convert_to_tensor=False,
+                prompt="search_document: "
+            )
+
+            for j, vector in enumerate(batch_vectors):
+                chunk = batch_chunks[j]
+                points.append(
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=vector.tolist(),
+                        payload={
+                            'text': chunk.text,
+                            'metadatas': {
+                                'filename': file_name,
+                                'title': chunk.meta.headings if chunk.meta.headings else "Инструкция"
+                            }
+                        }
+                    )
+                )
+        
+        self.client.upsert(collection_name=self.collection_name, points=points)
 
 
     def clear_db(self):
 
         try:
-            self.client.delete_collection(os.getenv("COLLECTION_NAME"))
+            self.client.delete_collection(self.collection_name)
             self.client.create_collection(collection_name = os.getenv("COLLECTION_NAME"),
                 vectors_config=VectorParams(size=768, distance=Distance.COSINE))
 
@@ -108,7 +144,7 @@ class RagManager:
    
     def __init__(self):
        
-        self.history = []
+        self.histories = {}
         self.processor  = DocumentProcessor()
         self.store = VectorStore()
 
@@ -120,26 +156,39 @@ class RagManager:
         else:
             print('Нет чанков!')
 
+    def clearHistory(self,user_id):
 
-    def ask(self, query):
+        try:
 
+            if self.histories.get(user_id):
+
+                self.histories.pop(user_id)
+
+        except Exception as e:
+
+             raise e
+
+
+    def ask(self, query,user_id=0):
+
+        user_history = self.histories.get(user_id, [])
         emb_qiery = self.store.emb_fn.encode(query).tolist()
         search_results = self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=8).points
         
         if not search_results:
             return "Информация не найдена"
 
-        docs = [f"Документ: {hit.payload['metadatas']['filename']} | Тема: {hit.payload['metadatas']['title']}\n{hit.payload['text']}" for hit in search_results]
+        docs = [f"Документ: {hit.payload['metadatas']['filename']}\n{hit.payload['text']}" for hit in search_results]
         context_text = "\n\n".join(docs)
 
         history_text = ""
-        if self.history:
+        if user_history:
             history_text = "Предыдущий диалог:\n"
-            for turn in self.history[-5:]:  
+            for turn in user_history[-5:]:  
                 history_text += f"Пользователь: {turn['user']}\n"
                 history_text += f"Ассистент: {turn['assistant']}\n"
        
-        prompt = f"""Ты — база знаний, ассистент специалиста технической поддержки Axapta. Твоя задача: ответить на вопрос, используя данные из базы данных, при выводе ответа укажи тему инструкции и её дату откуда был взят ответ
+        prompt = f"""Ты — база знаний, ассистент специалиста технической поддержки Axapta. Твоя задача: ответить на вопрос, используя данные из базы данных, при выводе ответа укажи тему инструкции(название файла) и её дату откуда был взят ответ
                 ПРАВИЛА:
                 1. Отвечай ТОЛЬКО на основе предоставленных документов
                 2. Если вопрос уточняющий ("не понял", "подробнее") - используй ТЕ ЖЕ документы, что и в предыдущем ответе
@@ -161,15 +210,21 @@ class RagManager:
 
         response = client.generate(model="qwen2.5:14b", prompt=prompt, options={'temperature': 0})
 
-        self.history.append({
-
+        if user_id not in self.histories:
+            self.histories[user_id] = []
+        
+        self.histories[user_id].append({
             'user': query,
             'assistant': response["response"]
-
         })
+        
+        self.histories[user_id] = self.histories[user_id][-5:]
 
         return response['response']
-    
+
+
+
+
 if __name__ == "__main__":
     
     rag = RagManager()
