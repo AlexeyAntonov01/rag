@@ -183,14 +183,16 @@ class RagManager:
         self.store = VectorStore()
         self.ollama_host = os.getenv("OLLAMA_HOST")
         self.client = AsyncClient(host=self.ollama_host)
+        self.semaphore = asyncio.Semaphore(10)
 
     async def upload_file(self,file_path):
 
-        chunks,file_name = await self.processor.getDocument(file_path)
-        if chunks:
-            await self.store.chunks2Collection(chunks,file_name)
-        else:
-            print('Нет чанков!')
+        async with self.semaphore:
+            chunks,file_name = await self.processor.getDocument(file_path)
+            if chunks:
+                await self.store.chunks2Collection(chunks,file_name)
+            else:
+                print('Нет чанков!')
 
     def clearHistory(self,user_id):
 
