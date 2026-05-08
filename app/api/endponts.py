@@ -12,8 +12,7 @@ router = APIRouter()
 async def ask_bot(request: Request, question: Question):
 
     rag = request.app.state.rag
-    loop = asyncio.get_running_loop()
-    answer = await loop.run_in_executor(None, rag.ask, question.text)
+    answer = await rag.ask(question.text)
     return {"answer": answer}
 
 
@@ -28,7 +27,8 @@ async def upload_pdf_store(request: Request,file_to_upload: str):
         return {"status": "error", "message": error_msg}
 
     try:
-        rag.upload_file(file_to_upload)
+
+        await rag.upload_file(file_to_upload)
         return {"status": "success", "message": f"Файл {file_to_upload} успешно загружен"}
     except Exception as e:
         print(f"ОШИБКА: {str(e)}")
@@ -40,7 +40,7 @@ async def drop_database(request: Request):
 
     rag = request.app.state.rag
     try:
-        rag.store.clear_db()
+        await rag.store.clear_db()
         return {"status": "success", "message": f"БД удалена"}
     except Exception as e:
         print(f"ОШИБКА: {str(e)}")

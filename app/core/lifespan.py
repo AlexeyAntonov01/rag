@@ -1,4 +1,4 @@
-from app.core.proccesor import RagManager 
+from app.core.proccesor import RagManager,VectorStore 
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import asyncio
@@ -10,6 +10,8 @@ async def lifespan(app: FastAPI):
 
     rag = RagManager()
     app.state.rag = rag
+
+    await app.state.rag._init_db()
 
     main_menu_commands = [
         BotCommand(command="/start", description="Старт"),

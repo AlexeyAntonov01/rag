@@ -50,8 +50,9 @@ async def cmd_clear(message: Message,rag: RagManager):
     
     if hasattr(rag,'clearHistory'):
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, rag.clearHistory,message.from_user.id)
+
+            rag.clearHistory(message.from_user.id)
+
             await message.answer('История удалена.')
 
         except Exception as e:
@@ -71,9 +72,9 @@ async def handle_message(message: Message,rag: RagManager):
             chat_id=message.chat.id,
             action="typing"
         )
-            loop = asyncio.get_event_loop()
 
-            answer = await loop.run_in_executor(None, rag.ask, message.text,message.from_user.id)
+            answer = await rag.ask(message.text,
+                                message.from_user.id)
             await status_msg.edit_text(answer)
     except Exception as e:
         await message.answer(f"Произошла ошибка: {str(e)}")

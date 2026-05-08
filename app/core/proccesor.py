@@ -1,6 +1,6 @@
 import os
-from ollama import Client
-from qdrant_client import QdrantClient
+from ollama import AsyncClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import(
     Distance,
     VectorParams,
@@ -39,58 +39,63 @@ class DocumentProcessor:
         self.chunker = HybridChunker(tokenizer=os.getenv("EMBED_MODEL"),max_tokens=512)
         
 
-    def getDocument(self, file_path):
+    async def getDocument(self, file_path):
 
         if not os.path.exists(file_path):
             return
 
-        try:
-            filename = os.path.basename(file_path)
-            temp_pdf_path = f"data/temp_no_images_{filename}"
+        loop = asyncio.get_running_loop()
 
-            with pymupdf.open(filename) as doc:
-                
-                for num, page in enumerate(doc):
+        def proccess_pdf():
 
-                    images = page.get_image_info(hashes=True)
-                    dict_[num] = images
+            try:
+                filename = os.path.basename(file_path)
+                temp_pdf_path = f"data/temp_no_images_{filename}"
 
-                    try:
+                with pymupdf.open(file_path) as doc:
+                    
+                    for num, page in enumerate(doc):
 
-                        for img in images:
+                        images = page.get_image_info(hashes=True)
 
-                            filename_hash = f"{filename}_{img['digest'].hex()}.png"
-                            save_path = f"extracted_images/{filename_hash}"
+                        try:
 
-                            pix = page.get_pixmap(clip = img['bbox'],matrix=pymupdf.Matrix(3,3))
-                            pix.save(save_path)
-                            pix = None
+                            for img in images:
 
-                            page.add_redact_annot(img['bbox'], fill = (1,1,1))
-                            page.apply_redactions()
+                                filename_hash = f"{filename}_{img['digest'].hex()}.png"
+                                save_path = f"extracted_images/{filename_hash}"
 
-                            point = (img['bbox'][0],img['bbox'][1])
+                                pix = page.get_pixmap(clip = img['bbox'],matrix=pymupdf.Matrix(3,3))
+                                pix.save(save_path)
+                                pix = None
 
-                            page.insert_text(point,
-                                            f'[IMAGE_REF:{filename_hash}]',
-                                            fontsize=7, 
-                                            color = (1,0,0))
-                            
-                    except Exception as page_error:
-                        print(f'Ошибка при разборе картинки на {num}:{page_error}')
-                        continue
+                                page.add_redact_annot(img['bbox'], fill = (1,1,1))
+                                page.apply_redactions()
 
-                doc.save(temp_pdf_path, garbage=4, deflate=True, clean=True)
-                
+                                point = (img['bbox'][0],img['bbox'][1])
 
-        except Exception as e:
+                                page.insert_text(point,
+                                                f'[IMAGE_REF:{filename_hash}]',
+                                                fontsize=7, 
+                                                color = (1,0,0))
+                                
+                        except Exception as page_error:
+                            print(f'Ошибка при разборе картинки на {num}:{page_error}')
+                            continue
 
-            print(f"Критическая ошибка при работе с файлом {filename}: {e}")
+                    doc.save(temp_pdf_path, garbage=4, deflate=True, clean=True)
+                    
 
-        result = self.docs_converter.convert(temp_pdf_path)
-        chunks = list(self.chunker.chunk(result.document))
+            except Exception as e:
 
-        return chunks, file_name
+                print(f"Критическая ошибка при работе с файлом {filename}: {e}")
+
+            result = self.docs_converter.convert(temp_pdf_path)
+            chunks = list(self.chunker.chunk(result.document))
+
+            return chunks, filename
+
+        return await loop.run_in_executor(None,proccess_pdf)
     
 
 class VectorStore:
@@ -98,61 +103,43 @@ class VectorStore:
     def __init__(self):
 
         self.collection_name = os.getenv("COLLECTION_NAME")
-        qdrant_host = os.getenv("QDRANT_HOST")
-        self.client = QdrantClient(host = qdrant_host,port=int(os.getenv("QDRANT_PORT")))
-
-        if not self.client.collection_exists(self.collection_name):
-
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config = VectorParams(size=768,distance=Distance.COSINE))
-           
+        self.qdrant_host = os.getenv("QDRANT_HOST")
+        self.client = AsyncQdrantClient(host = self.qdrant_host,port=int(os.getenv("QDRANT_PORT")))
+       
         self.emb_fn = SentenceTransformer(
             os.getenv("EMBED_MODEL"),
             trust_remote_code=True
         )
 
+    async def _init_db(self):
 
-    def old_chunks2Collection(self,chunks,file_name):
-        
-        points = []
+        if not await self.client.collection_exists(self.collection_name):
 
-        for chunk in chunks:
-        
-            title = chunk.meta.headings[0] if chunk.meta.headings else "Название отсутсвует"
-
-            points.append(
-                    PointStruct(
-                        id = str(uuid.uuid4()),
-                        vector = self.emb_fn.encode(chunk.text).tolist(),
-                        payload = {'text':chunk.text,
-                                        'metadatas':
-                                        {'filename':file_name,
-                                         'title':title}
-                                        
-                                }
-                        )
-                    )                                           
-                    
-        self.client.upsert(collection_name = self.collection_name,points = points)
+            await self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config = VectorParams(size=768,distance=Distance.COSINE))
 
 
-    def chunks2Collection(self,chunks,file_name):
+    async def chunks2Collection(self,chunks,file_name):
         
         points = []
         batch_size = 16 
         all_texts = [chunk.text for chunk in chunks]
+        loop = asyncio.get_running_loop()
 
         for i in range(0, len(all_texts), batch_size):
 
             batch_texts = all_texts[i:i + batch_size]
             batch_chunks = chunks[i:i + batch_size]
 
-            batch_vectors = self.emb_fn.encode(
+            batch_vectors = await loop.run_in_executor(None,
+
+                lambda: self.emb_fn.encode(
                 batch_texts,
                 convert_to_tensor=False,
                 prompt="search_document: "
             )
+                )
 
             for j, vector in enumerate(batch_vectors):
                 chunk = batch_chunks[j]
@@ -170,15 +157,17 @@ class VectorStore:
                     )
                 )
         
-        self.client.upsert(collection_name=self.collection_name, points=points)
+        await self.client.upsert(collection_name=self.collection_name, points=points)
 
 
-    def clear_db(self):
+    async def clear_db(self):
 
         try:
-            self.client.delete_collection(self.collection_name)
-            self.client.create_collection(collection_name = os.getenv("COLLECTION_NAME"),
+            await self.client.delete_collection(self.collection_name)
+            await self.client.create_collection(collection_name = os.getenv("COLLECTION_NAME"),
                 vectors_config=VectorParams(size=768, distance=Distance.COSINE))
+
+            return True
 
         except Exception as e:
             return e
@@ -192,33 +181,32 @@ class RagManager:
         self.histories = {}
         self.processor  = DocumentProcessor()
         self.store = VectorStore()
+        self.ollama_host = os.getenv("OLLAMA_HOST")
+        self.client = AsyncClient(host=self.ollama_host)
 
-    def upload_file(self,file_path):
+    async def upload_file(self,file_path):
 
-        chunks,file_name = self.processor.getDocument(file_path)
+        chunks,file_name = await self.processor.getDocument(file_path)
         if chunks:
-            self.store.chunks2Collection(chunks,file_name)
+            await self.store.chunks2Collection(chunks,file_name)
         else:
             print('Нет чанков!')
 
     def clearHistory(self,user_id):
 
-        try:
-
-            if self.histories.get(user_id):
-
-                self.histories.pop(user_id)
-
-        except Exception as e:
-
-             raise e
+        self.histories.pop(user_id)
 
 
-    def ask(self, query,user_id=0):
+    async def ask(self, query,user_id=0):
 
         user_history = self.histories.get(user_id, [])
-        emb_qiery = self.store.emb_fn.encode(query).tolist()
-        search_results = self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=8).points
+        loop = asyncio.get_running_loop()
+        emb_qiery = await loop.run_in_executor(
+            None,
+            lambda: self.store.emb_fn.encode(query).tolist()
+            )
+
+        search_results = await self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=8).points
         
         if not search_results:
             return "Информация не найдена"
@@ -249,11 +237,8 @@ class RagManager:
                 {query}
 
                 ОТВЕТ:"""
-        
-        ollama_host = os.getenv("OLLAMA_HOST")
-        client = Client(host=ollama_host)
 
-        response = client.generate(model="qwen2.5:14b", prompt=prompt, options={'temperature': 0})
+        response = await self.client.generate(model="qwen2.5:14b", prompt=prompt, options={'temperature': 0})
 
         if user_id not in self.histories:
             self.histories[user_id] = []
