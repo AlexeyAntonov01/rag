@@ -36,7 +36,9 @@ class DocumentProcessor:
                 InputFormat.PDF: pdf_options
             }
             )    
-        self.chunker = HybridChunker(tokenizer=os.getenv("EMBED_MODEL"),max_tokens=512)
+        self.chunker = HybridChunker(tokenizer=os.getenv("EMBED_MODEL"),
+                                    max_tokens=512,
+                                    merge_peers=True)
         
 
     async def getDocument(self, file_path):
