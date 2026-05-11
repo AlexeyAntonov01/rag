@@ -6,6 +6,7 @@ from qdrant_client.models import(
     VectorParams,
     PointStruct
     )
+import asyncio
 from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 from sentence_transformers import SentenceTransformer
@@ -64,8 +65,8 @@ class DocumentProcessor:
 
                             for img in images:
 
-                                filename_hash = f"{filename}_{img['digest'].hex()}.png"
-                                save_path = f"extracted_images/{filename_hash}"
+                                filename_hash = f"{img['digest'].hex()}.png"
+                                save_path = f"data/output_images/{filename_hash}"
 
                                 pix = page.get_pixmap(clip = img['bbox'],matrix=pymupdf.Matrix(3,3))
                                 pix.save(save_path)
@@ -210,7 +211,7 @@ class RagManager:
             lambda: self.store.emb_fn.encode(query).tolist()
             )
 
-        search_results = await self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=8).points
+        search_results = (await self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=8)).points
         
         if not search_results:
             return "Информация не найдена"
@@ -242,7 +243,7 @@ class RagManager:
 
                 ОТВЕТ:"""
 
-        response = await self.client.generate(model="qwen2.5:14b", prompt=prompt, options={'temperature': 0})
+        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0})
 
         if user_id not in self.histories:
             self.histories[user_id] = []

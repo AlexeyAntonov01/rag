@@ -11,7 +11,7 @@ async def lifespan(app: FastAPI):
     rag = RagManager()
     app.state.rag = rag
 
-    await app.state.rag._init_db()
+    await app.state.rag.store._init_db()
 
     main_menu_commands = [
         BotCommand(command="/start", description="Старт"),
