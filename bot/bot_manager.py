@@ -6,7 +6,9 @@ from aiogram.filters import Command
 from app.core.proccesor import RagManager
 from aiogram import BaseMiddleware
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types.input_file import FSInputFile
 from aiogram import F
+import re
 
 ALLOWED_USERS = [
     int(user_id.strip()) 
@@ -23,6 +25,8 @@ class AccessMiddleware(BaseMiddleware):
 
 PROXY_URL = os.getenv('PROXY')
 BOT_TOKEN  = os.getenv('TELEGRAM_TOKEN')
+IMAGE_PATTERN = r'\[REF_IMAGE:([^]]+\.png)\]'
+images_path = 'extracted_images' #УБРАТЬ В ENV ДОМА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 dp = Dispatcher()
 dp.message.outer_middleware(AccessMiddleware())
@@ -74,6 +78,41 @@ async def handle_message(message: Message,rag: RagManager):
 
             answer = await rag.ask(message.text,
                                 message.from_user.id)
-            await status_msg.edit_text(answer)
+
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            split_answer = re.split(IMAGE_PATTERN,answer)
+
+            for block in split_answer:
+                block = block.strip()
+
+                if not block:
+                    continue
+
+                if block.endswith('.png'):
+                    file_path = f'{images_path}/{block}'
+
+                    if not os.path.exists(file_path):
+                        print(f'Ошибка. Файл не найден по пути {file_path}')
+                        await message.answer(f'Картинка не найдена')
+                        continue
+
+                    image = FSInputFile(file_path)
+                    await message.bot.send_photo(chat_id=message.chat.id, photo=image)
+                    await message.bot.send_chat_action(
+                                    chat_id=message.chat.id,
+                                    action="typing")
+
+                else:
+
+                    await message.bot.send_message(chat_id=message.chat.id, text=block)
+                    await message.bot.send_chat_action(
+                                    chat_id=message.chat.id,
+                                    action="typing")
+
     except Exception as e:
         await message.answer(f"Произошла ошибка: {str(e)}")
