@@ -1,1 +1,15 @@
 models/
+data/
+qdrant_storage/
+
+
+.venv/
+venv/
+env/
+
+
+.git/
+.idea/
+.vscode/
+**/__pycache__/
+*.pyc

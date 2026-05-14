@@ -19,6 +19,7 @@ from docling.datamodel.base_models import InputFormat
 import uuid
 from pathlib import Path
 import pymupdf
+import hashlib
 
 
 class DocumentProcessor:
@@ -75,7 +76,7 @@ class DocumentProcessor:
                                 page.add_redact_annot(img['bbox'], fill = (1,1,1))
                                 page.apply_redactions()
 
-                                point = (img['bbox'][0],img['bbox'][1])
+                                point = (img['bbox'][0], img['bbox'][1])
 
                                 page.insert_text(point,
                                                 f'[IMAGE_REF:{filename_hash}]',
@@ -129,7 +130,7 @@ class VectorStore:
         batch_size = 16 
         all_texts = [chunk.text for chunk in chunks]
         loop = asyncio.get_running_loop()
-
+        
         for i in range(0, len(all_texts), batch_size):
 
             batch_texts = all_texts[i:i + batch_size]
@@ -145,10 +146,15 @@ class VectorStore:
                 )
 
             for j, vector in enumerate(batch_vectors):
+
                 chunk = batch_chunks[j]
+
+                text_hash = hashlib.md5(chunk.text.encode('utf-8')).hexdigest()
+                stable_id = str(uuid.UUID(text_hash))
+
                 points.append(
                     PointStruct(
-                        id=str(uuid.uuid4()),
+                        id=stable_id,
                         vector=vector.tolist(),
                         payload={
                             'text': chunk.text,
@@ -226,24 +232,26 @@ class RagManager:
                 history_text += f"Пользователь: {turn['user']}\n"
                 history_text += f"Ассистент: {turn['assistant']}\n"
        
-        prompt = f"""Ты — база знаний, ассистент специалиста технической поддержки Axapta. Твоя задача: ответить на вопрос, используя данные из базы данных, при выводе ответа укажи тему инструкции(название файла) и её дату откуда был взят ответ
-                ПРАВИЛА:
-                1. Отвечай ТОЛЬКО на основе предоставленных документов
-                2. Если вопрос уточняющий ("не понял", "подробнее") - используй ТЕ ЖЕ документы, что и в предыдущем ответе
-                3. Всегда указывай название документа-источника
-                4. Если информация не найдена - скажи "Информация не найдена в базе знаний Axapta"
-                КОНТЕКСТ:
+        prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
+
+                СТРОГИЕ ПРАВИЛА:
+                1. ОГРАНИЧЕНИЕ ЗНАНИЙ: Используй ТОЛЬКО информацию из блока КОНТЕКСТ. Тебе запрещено использовать любые внешние знания о Axapta или додумывать факты. Если в контексте нет прямого ответа, твой единственный валидный ответ: "Информация не найдена в базе знаний Axapta".
+                2. РАБОТА С КАРТИНКАМИ: Внутри предоставленного контекста могут встречаться специальные метки формата [IMAGE_REF:имя_файла.png]. Если текст, который ты берешь для ответа, содержит такую метку, ты ОБЯЗАН скопировать её в свой ответ в точно таком же виде, без изменений, пробелов внутри скобок и кавычек. Не удаляй и не перефразируй метки [IMAGE_REF:...].
+                3. КОНТЕКСТ УТОЧНЕНИЙ: Если вопрос пользователя является уточняющим ("почему?", "объясни подробнее", "не понял"), соотноси его с ИСТОРИЕЙ ДИАЛОГА, но ответ строй строго по текущему КОНТЕКСТУ.
+                4. ОФОРМЛЕНИЕ ИСТОЧНИКА: В самом конце своего ответа, с новой строки, обязательно укажи источник в формате:
+                Источник: <Название файла> (Дата: <Дата из текста инструкции, если есть>). Если источников несколько, перечисли их списком.
+
+                КОНТЕКСТ ДЛЯ ОТВЕТА:
                 {context_text}
 
                 ИСТОРИЯ ДИАЛОГА:
                 {history_text}
 
-                ВОПРОС:
-                {query}
+                ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
 
-                ОТВЕТ:"""
+                ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
 
-        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0})
+        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 8192})
 
         if user_id not in self.histories:
             self.histories[user_id] = []

@@ -25,8 +25,8 @@ class AccessMiddleware(BaseMiddleware):
 
 PROXY_URL = os.getenv('PROXY')
 BOT_TOKEN  = os.getenv('TELEGRAM_TOKEN')
-IMAGE_PATTERN = r'\[REF_IMAGE:([^]]+\.png)\]'
-images_path = 'extracted_images' #УБРАТЬ В ENV ДОМА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+IMAGE_PATTERN = r'\[IMAGE_REF:([^]]+\.png)\]'
+images_path = './data/output_images' #УБРАТЬ В ENV ДОМА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 dp = Dispatcher()
 dp.message.outer_middleware(AccessMiddleware())
@@ -98,7 +98,7 @@ async def handle_message(message: Message,rag: RagManager):
 
                     if not os.path.exists(file_path):
                         print(f'Ошибка. Файл не найден по пути {file_path}')
-                        await message.answer(f'Картинка не найдена')
+                        await message.answer(f'Картинка не найдена по пути {file_path}')
                         continue
 
                     image = FSInputFile(file_path)
