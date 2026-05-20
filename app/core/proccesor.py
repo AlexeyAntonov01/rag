@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 import pymupdf
 import hashlib
+from functools import partial
 
 
 class DocumentProcessor:
@@ -136,13 +137,9 @@ class VectorStore:
             batch_texts = all_texts[i:i + batch_size]
             batch_chunks = chunks[i:i + batch_size]
 
-            batch_vectors = await loop.run_in_executor(None,
+            encode_func = partial(self.store.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt="search_document: ")
 
-                lambda: self.emb_fn.encode(
-                batch_texts,
-                convert_to_tensor=False,
-                prompt="search_document: "
-            )
+            batch_vectors = await loop.run_in_executor(None,encode_func
                 )
 
             for j, vector in enumerate(batch_vectors):
@@ -193,6 +190,7 @@ class RagManager:
         self.ollama_host = os.getenv("OLLAMA_HOST")
         self.client = AsyncClient(host=self.ollama_host)
         self.semaphore = asyncio.Semaphore(10)
+        self.emb_lock = asyncio.Lock() 
 
     async def upload_file(self,file_path):
 
@@ -212,12 +210,15 @@ class RagManager:
 
         user_history = self.histories.get(user_id, [])
         loop = asyncio.get_running_loop()
-        emb_qiery = await loop.run_in_executor(
-            None,
-            lambda: self.store.emb_fn.encode(query).tolist()
+        emb_qiery_func = partial(self.store.emb_fn.encode,query)
+        async with self.emb_lock:
+            emb_qiery_raw = await loop.run_in_executor(
+                None,
+                emb_qiery_func
             )
+        emb_qiery = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
 
-        search_results = (await self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=8)).points
+        search_results = (await self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=15)).points
         
         if not search_results:
             return "Информация не найдена"
@@ -251,7 +252,7 @@ class RagManager:
 
                 ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
 
-        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 8192})
+        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 12288})
 
         if user_id not in self.histories:
             self.histories[user_id] = []

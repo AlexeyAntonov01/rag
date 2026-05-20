@@ -7,7 +7,6 @@ import asyncio
 
 router = APIRouter()
 
-
 @router.post("/ask")
 async def ask_bot(request: Request, question: Question):
 
@@ -45,8 +44,5 @@ async def drop_database(request: Request):
     except Exception as e:
         print(f"ОШИБКА: {str(e)}")
         return {"status": "error", "message": str(e)}
-
-
-
     
 
