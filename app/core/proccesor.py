@@ -21,6 +21,7 @@ from pathlib import Path
 import pymupdf
 import hashlib
 from functools import partial
+import re
 
 
 class DocumentProcessor:
@@ -80,7 +81,7 @@ class DocumentProcessor:
                                 point = (img['bbox'][0], img['bbox'][1])
 
                                 page.insert_text(point,
-                                                f'[IMAGE_REF:{filename_hash}]',
+                                                f'<image_ref>{filename_hash}</image_ref>',
                                                 fontsize=7, 
                                                 color = (1,0,0))
                                 
@@ -130,6 +131,16 @@ class VectorStore:
         points = []
         batch_size = 16 
         all_texts = [chunk.text for chunk in chunks]
+        
+        for chunk in chunks:
+
+            text_fixed = chunk.text
+            text_fixed = re.sub(r'\s+(<image_ref>)', r' \1', text_fixed)
+
+            chunk.text = text_fixed
+
+        all_texts = [chunk.text for chunk in chunks]
+
         loop = asyncio.get_running_loop()
         
         for i in range(0, len(all_texts), batch_size):
@@ -137,7 +148,7 @@ class VectorStore:
             batch_texts = all_texts[i:i + batch_size]
             batch_chunks = chunks[i:i + batch_size]
 
-            encode_func = partial(self.store.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt="search_document: ")
+            encode_func = partial(self.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt="search_document: ")
 
             batch_vectors = await loop.run_in_executor(None,encode_func
                 )
@@ -157,7 +168,7 @@ class VectorStore:
                             'text': chunk.text,
                             'metadatas': {
                                 'filename': file_name,
-                                'title': chunk.meta.headings if chunk.meta.headings else "Инструкция"
+                                'title': chunk.meta.headings if chunk.meta.headings else None
                             }
                         }
                     )
@@ -199,11 +210,21 @@ class RagManager:
             if chunks:
                 await self.store.chunks2Collection(chunks,file_name)
             else:
-                print('Нет чанков!')
+                print('Нет чанков!',flush=True)
+
+    async def upload_file_multi(self,file_path_list:list):
+
+        #последовательно иначе oom
+        for file_nm in file_path_list:    
+            chunks,file_name = await self.processor.getDocument(file_nm)
+            if chunks:
+                await self.store.chunks2Collection(chunks,file_name)
+            else:
+                print('Нет чанков!',flush=True)
 
     def clearHistory(self,user_id):
 
-        self.histories.pop(user_id)
+        self.histories.pop(user_id,None)
 
 
     async def ask(self, query,user_id=0):
@@ -222,7 +243,7 @@ class RagManager:
         
         if not search_results:
             return "Информация не найдена"
-
+      
         docs = [f"Документ: {hit.payload['metadatas']['filename']}\n{hit.payload['text']}" for hit in search_results]
         context_text = "\n\n".join(docs)
 
@@ -235,12 +256,12 @@ class RagManager:
        
         prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
 
-                СТРОГИЕ ПРАВИЛА:
-                1. ОГРАНИЧЕНИЕ ЗНАНИЙ: Используй ТОЛЬКО информацию из блока КОНТЕКСТ. Тебе запрещено использовать любые внешние знания о Axapta или додумывать факты. Если в контексте нет прямого ответа, твой единственный валидный ответ: "Информация не найдена в базе знаний Axapta".
-                2. РАБОТА С КАРТИНКАМИ: Внутри предоставленного контекста могут встречаться специальные метки формата [IMAGE_REF:имя_файла.png]. Если текст, который ты берешь для ответа, содержит такую метку, ты ОБЯЗАН скопировать её в свой ответ в точно таком же виде, без изменений, пробелов внутри скобок и кавычек. Не удаляй и не перефразируй метки [IMAGE_REF:...].
-                3. КОНТЕКСТ УТОЧНЕНИЙ: Если вопрос пользователя является уточняющим ("почему?", "объясни подробнее", "не понял"), соотноси его с ИСТОРИЕЙ ДИАЛОГА, но ответ строй строго по текущему КОНТЕКСТУ.
-                4. ОФОРМЛЕНИЕ ИСТОЧНИКА: В самом конце своего ответа, с новой строки, обязательно укажи источник в формате:
-                Источник: <Название файла> (Дата: <Дата из текста инструкции, если есть>). Если источников несколько, перечисли их списком.
+                ПРАВИЛА:
+                1. Максимально полный ответ: используй ВСЮ информацию из контекста (все шаги, примечания, условия)
+                2. При уточняющих вопросах ("почему?", "подробнее") используй ИСТОРИЮ ДИАЛОГА, но ответ строй по текущему КОНТЕКСТУ
+                3. Работа с картинками: XML-теги <image_ref>...</image_ref> - копируй в ответ ТОЧНО на тех же местах
+                4. Запрещены внешние знания. Если нет ответа: "Информация не найдена в базе знаний Axapta"
+                5. В конце: "Источник: <название файла>"
 
                 КОНТЕКСТ ДЛЯ ОТВЕТА:
                 {context_text}

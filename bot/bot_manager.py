@@ -25,7 +25,7 @@ class AccessMiddleware(BaseMiddleware):
 
 PROXY_URL = os.getenv('PROXY')
 BOT_TOKEN  = os.getenv('TELEGRAM_TOKEN')
-IMAGE_PATTERN = r'\[IMAGE_REF:([^]]+\.png)\]'
+IMAGE_PATTERN = r'<image_ref>([^<]+\.png)</image_ref>'
 images_path = './data/output_images' #УБРАТЬ В ENV ДОМА!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 dp = Dispatcher()
@@ -70,7 +70,7 @@ async def handle_message(message: Message,rag: RagManager):
     try:
         if message.text:
 
-            status_msg = await message.answer("Ollama думает, она польность не влезла в gpu, поэтому надо подождать..")
+            status_msg = await message.answer("Ollama думает...")
             await message.bot.send_chat_action(
             chat_id=message.chat.id,
             action="typing"
@@ -86,7 +86,7 @@ async def handle_message(message: Message,rag: RagManager):
                 pass
 
             split_answer = re.split(IMAGE_PATTERN,answer)
-
+            print(split_answer, flush=True) 
             for block in split_answer:
                 block = block.strip()
 
