@@ -1,32 +1,28 @@
 from fastapi import (
-    APIRouter, Request 
+    APIRouter,Depends
     )
 from app.schemas.schemas import Question
+from ..core.dependencies import get_rag
 import os
 import asyncio
 
 router = APIRouter()
 
 @router.post("/ask")
-async def ask_bot(request: Request, question: Question):
+async def ask_bot(question: Question, rag = Depends(get_rag)):
 
-    rag = request.app.state.rag
     answer = await rag.ask(question.text)
     return {"answer": answer}
 
 
 @router.post("/upload_pdf")
-async def upload_pdf_store(request: Request,file_to_upload: str):
-
-    rag = request.app.state.rag
+async def upload_pdf_store(file_to_upload: str, rag = Depends(get_rag)):
 
     if not os.path.exists(file_to_upload):
         error_msg = f"ФАЙЛ НЕ НАЙДЕН: {os.path.abspath(file_to_upload)}"
         print(error_msg)
         return {"status": "error", "message": error_msg}
-
     try:
-
         await rag.upload_file(file_to_upload)
         return {"status": "success", "message": f"Файл {file_to_upload} успешно загружен"}
     except Exception as e:
@@ -35,9 +31,7 @@ async def upload_pdf_store(request: Request,file_to_upload: str):
     
 
 @router.post("/upload_pdf_batch")
-async def upload_pdf_batch_store(request: Request,file_path_to_upload: str):
-
-    rag = request.app.state.rag
+async def upload_pdf_batch_store(file_path_to_upload: str, rag = Depends(get_rag)):
 
     #указываю папку с файлами
     if not os.path.exists(file_path_to_upload):
@@ -47,10 +41,8 @@ async def upload_pdf_batch_store(request: Request,file_path_to_upload: str):
         return {"status": "error", "message": error_msg}
 
     try:
-
         loop = asyncio.get_running_loop()
         
-
         def find_file_name():
             
             file_list = []
@@ -71,9 +63,8 @@ async def upload_pdf_batch_store(request: Request,file_path_to_upload: str):
     
 
 @router.post("/drop_db")
-async def drop_database(request: Request):
+async def drop_database(rag = Depends(get_rag)):
 
-    rag = request.app.state.rag
     try:
         await rag.store.clear_db()
         return {"status": "success", "message": f"БД удалена"}
