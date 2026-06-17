@@ -1,11 +1,15 @@
 import os
 from ollama import AsyncClient
-from qdrant_client import AsyncQdrantClient
+from qdrant_client import AsyncQdrantClient,models
 from qdrant_client.models import(
     Distance,
     VectorParams,
-    PointStruct
+    PointStruct,
+    SparseVectorParams,
+    Prefetch,
+    RrfQuery
     )
+from fastembed.sparse import SparseTextEmbedding
 import asyncio
 from docling.chunking import HybridChunker
 from sentence_transformers import SentenceTransformer
@@ -98,7 +102,7 @@ class DocumentProcessor:
             result = self.docs_converter.convert(temp_pdf_path)
             chunks = list(self.chunker.chunk(result.document))
 
-            return chunks, filename
+            return chunks, filename, result
 
         return await loop.run_in_executor(None,proccess_pdf)
     
@@ -110,6 +114,7 @@ class VectorStore:
         self.collection_name = os.getenv("COLLECTION_NAME")
         self.qdrant_host = os.getenv("QDRANT_HOST")
         self.client = AsyncQdrantClient(host = self.qdrant_host,port=int(os.getenv("QDRANT_PORT")))
+        self.sparse_emb_fn = SparseTextEmbedding(model_name="Qdrant/bm25")
        
         self.emb_fn = SentenceTransformer(
             os.getenv("EMBED_MODEL"),
@@ -122,22 +127,26 @@ class VectorStore:
 
             await self.client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config = VectorParams(size=768,distance=Distance.COSINE))
+               
 
+                vectors_config = {'dense': VectorParams(size=768,distance=Distance.COSINE)},
 
-    async def chunks2Collection(self,chunks,file_name):
+                sparse_vectors_config = {'sparse':SparseVectorParams()}
+
+                )
+
+    async def chunks2Collection(self,chunks,file_name,response_generated_topic):
         
         points = []
         batch_size = 16 
-        all_texts = [chunk.text for chunk in chunks]
-        
+        custom_prompt = f"search_document: Этот текст взят из документа {file_name}. Текст: "
+
         for chunk in chunks:
 
             text_fixed = chunk.text
             text_fixed = re.sub(r'\s+(<image_ref>)', r' \1', text_fixed)
-
             chunk.text = text_fixed
-
+            
         all_texts = [chunk.text for chunk in chunks]
 
         loop = asyncio.get_running_loop()
@@ -147,27 +156,41 @@ class VectorStore:
             batch_texts = all_texts[i:i + batch_size]
             batch_chunks = chunks[i:i + batch_size]
 
-            encode_func = partial(self.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt="search_document: ")
+            encode_func = partial(self.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt=custom_prompt)
+            encode_func_sparse = partial(self.sparse_emb_fn.encode,batch_texts)
 
-            batch_vectors = await loop.run_in_executor(None,encode_func
-                )
+            batch_vectors = await loop.run_in_executor(None,encode_func)
+            batch_sparse_raw = await loop.run_in_executor(None,encode_func_sparse)
+            batch_sparse = list(batch_sparse_raw)
 
             for j, vector in enumerate(batch_vectors):
 
                 chunk = batch_chunks[j]
+                current_sparse = batch_sparse[j]
 
                 text_hash = hashlib.md5(chunk.text.encode('utf-8')).hexdigest()
                 stable_id = str(uuid.UUID(text_hash))
 
+                vector_sparse = models.SparseVector(
+
+                        indices = current_sparse.indices.tolist(),
+                        values = current_sparse.values.tolist()
+                    )
+
                 points.append(
                     PointStruct(
                         id=stable_id,
-                        vector=vector.tolist(),
+                        vector=
+                            {
+                                'dense' :vector.tolist(),
+                                'sparse':vector_sparse
+                            }
+                        ,
                         payload={
                             'text': chunk.text,
                             'metadatas': {
                                 'filename': file_name,
-                                'title': chunk.meta.headings if chunk.meta.headings else None
+                                'title': response_generated_topic if response_generated_topic else 'Неизвестно'
                             }
                         }
                     )
@@ -180,13 +203,16 @@ class VectorStore:
 
         try:
             await self.client.delete_collection(self.collection_name)
-            await self.client.create_collection(collection_name = os.getenv("COLLECTION_NAME"),
-                vectors_config=VectorParams(size=768, distance=Distance.COSINE))
+            await self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config = {'dense': VectorParams(size=768,distance=Distance.COSINE)},
+                        sparse_vectors_config = {'sparse':SparseVectorParams()}
+            )
 
             return True
 
         except Exception as e:
-            return e
+            raise  e
 
 
 class RagManager:
@@ -199,15 +225,19 @@ class RagManager:
         self.store = VectorStore()
         self.ollama_host = os.getenv("OLLAMA_HOST")
         self.client = AsyncClient(host=self.ollama_host)
-        self.semaphore = asyncio.Semaphore(10)
+        self.semaphore = asyncio.Semaphore(1)
         self.emb_lock = asyncio.Lock() 
 
     async def upload_file(self,file_path):
 
         async with self.semaphore:
-            chunks,file_name = await self.processor.getDocument(file_path)
+            chunks,file_name,result = await self.processor.getDocument(file_path)
+
+            full_text_markdown = result.document.export_to_markdown()
+
             if chunks:
-                await self.store.chunks2Collection(chunks,file_name)
+                response_generated_topic = await self.generate_topic_prompt(full_text_markdown)
+                await self.store.chunks2Collection(chunks,file_name,response_generated_topic)
             else:
                 print('Нет чанков!',flush=True)
 
@@ -215,11 +245,27 @@ class RagManager:
 
         #последовательно иначе oom
         for file_nm in file_path_list:    
-            chunks,file_name = await self.processor.getDocument(file_nm)
+            chunks,file_name,result = await self.processor.getDocument(file_nm)
+            full_text_markdown = result.document.export_to_markdown()
+
             if chunks:
-                await self.store.chunks2Collection(chunks,file_name)
+                response_generated_topic = await self.generate_topic_prompt(full_text_markdown)
+                await self.store.chunks2Collection(chunks,file_name,response_generated_topic)
             else:
                 print('Нет чанков!',flush=True)
+
+
+    async def generate_topic_prompt(self,full_text_markdown):
+
+        topic_prompt = f"""
+                Ты - опытный аналитик технической документации и инструкций. Твоя задача — изучить текст документа и сформулировать ОДНУ главную тему этого документа на русском языке. ВАЖНО: Умести тему в одно предложение\n\n
+                Текст документа:
+                {full_text_markdown}
+            """
+        response_generated_topic = await self.client.generate(model='qwen2.5:7b', prompt=topic_prompt)
+
+        return response_generated_topic['response']
+
 
     def clearHistory(self,user_id):
 
@@ -231,20 +277,47 @@ class RagManager:
         user_history = self.histories.get(user_id, [])
         loop = asyncio.get_running_loop()
         emb_qiery_func = partial(self.store.emb_fn.encode,query)
+        emb_qiery_sparse_func = partial(self.store.sparse_emb_fn.encode,[query])
+
         async with self.emb_lock:
-            emb_qiery_raw = await loop.run_in_executor(
+            emb_qiery_raw_task =  loop.run_in_executor(
                 None,
                 emb_qiery_func
             )
+            emb_qiery_sparse_raw_task =  loop.run_in_executor(
+                None,
+                emb_qiery_sparse_func
+                )
+        emb_qiery_raw,emb_qiery_sparse_raw = await asyncio.gather(emb_qiery_raw_task,emb_qiery_sparse_raw_task)
+
+
         emb_qiery = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
 
-        search_results = (await self.store.client.query_points(query=emb_qiery,collection_name = os.getenv("COLLECTION_NAME"),limit=15)).points
+        emb_qiery_sparse_list = list(emb_qiery_sparse_raw)
+        current_emb_qiery_sparse = emb_qiery_sparse_list[0]
+
+        emb_qiery_sparse = models.SparseVector(
+                        indices = current_emb_qiery_sparse.indices.tolist(),
+                        values = current_emb_qiery_sparse.values.tolist()
+            )
+
+        search_results = (await self.store.client.query_points(
+                                            collection_name = os.getenv("COLLECTION_NAME"),
+                                            prefetch = [
+                                                    Prefetch(query = emb_qiery, using ='dense',limit=20),      
+                                                    Prefetch(query = emb_qiery_sparse, using ='sparse',limit=20)],
+                                            query= RrfQuery(rrf=models.Rrf()),
+                                            limit = 15
+                                            )
+
+                        ).points
         
         if not search_results:
             return "Информация не найдена"
       
-        docs = [f"Документ: {hit.payload['metadatas']['filename']}\n{hit.payload['text']}" for hit in search_results]
+        docs = [f"--- ФРАГМЕНТ №{i} ---\nДокумент: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for i, hit in enumerate(search_results, 1)]
         context_text = "\n\n".join(docs)
+
 
         history_text = ""
         if user_history:
@@ -272,7 +345,7 @@ class RagManager:
 
                 ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
 
-        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 12288})
+        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 14000})
 
         if user_id not in self.histories:
             self.histories[user_id] = []
