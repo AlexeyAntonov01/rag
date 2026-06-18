@@ -326,11 +326,7 @@ class RagManager:
             docs = [f"---Документ: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for hit in search_results]
 
             reranker_score_partial = partial(self.reranker.rerank,query,docs)
-            reranker_score = await loop.run_in_executor(None,reranker_score_partial)
-
-            if not isinstance(reranker_score,list):
-
-                reranker_score = [reranker_score]
+            reranker_score = list(await loop.run_in_executor(None,reranker_score_partial))
 
             if len(reranker_score) > 0 and reranker_score[0].score <= 0.35:
 
