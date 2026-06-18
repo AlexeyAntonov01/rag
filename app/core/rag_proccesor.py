@@ -9,6 +9,7 @@ from qdrant_client.models import(
     Prefetch,
     RrfQuery
     )
+from fastembed import TextReranker
 from fastembed.sparse import SparseTextEmbedding
 import asyncio
 from docling.chunking import HybridChunker
@@ -226,7 +227,9 @@ class RagManager:
         self.ollama_host = os.getenv("OLLAMA_HOST")
         self.client = AsyncClient(host=self.ollama_host)
         self.semaphore = asyncio.Semaphore(1)
-        self.emb_lock = asyncio.Lock() 
+        self.emb_lock = asyncio.Lock()
+        self.reranker = TextReranker(model_name='BAAI/bge-reranker-v2-m3',normalize=True)
+        self.user_lock = {}
 
     async def upload_file(self,file_path):
 
@@ -274,88 +277,106 @@ class RagManager:
 
     async def ask(self, query,user_id=0):
 
-        user_history = self.histories.get(user_id, [])
-        loop = asyncio.get_running_loop()
-        emb_qiery_func = partial(self.store.emb_fn.encode,query)
-        emb_qiery_sparse_func = partial(self.store.sparse_emb_fn.encode,[query])
+        if user_id not in self.user_lock:
 
-        async with self.emb_lock:
-            emb_qiery_raw_task =  loop.run_in_executor(
-                None,
-                emb_qiery_func
-            )
-            emb_qiery_sparse_raw_task =  loop.run_in_executor(
-                None,
-                emb_qiery_sparse_func
+            self.user_lock[user_id] = asyncio.Lock()
+
+        async with self.user_lock[user_id]:
+
+            user_history = self.histories.get(user_id, [])
+            loop = asyncio.get_running_loop()
+            emb_qiery_func = partial(self.store.emb_fn.encode,query)
+            emb_qiery_sparse_func = partial(self.store.sparse_emb_fn.encode,[query])
+
+            async with self.emb_lock:
+                emb_qiery_raw_task =  loop.run_in_executor(
+                    None,
+                    emb_qiery_func
                 )
-        emb_qiery_raw,emb_qiery_sparse_raw = await asyncio.gather(emb_qiery_raw_task,emb_qiery_sparse_raw_task)
+                emb_qiery_sparse_raw_task =  loop.run_in_executor(
+                    None,
+                    emb_qiery_sparse_func
+                    )
+            emb_qiery_raw,emb_qiery_sparse_raw = await asyncio.gather(emb_qiery_raw_task,emb_qiery_sparse_raw_task)
+
+            emb_qiery = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
+
+            emb_qiery_sparse_list = list(emb_qiery_sparse_raw)
+            current_emb_qiery_sparse = emb_qiery_sparse_list[0]
+
+            emb_qiery_sparse = models.SparseVector(
+                            indices = current_emb_qiery_sparse.indices.tolist(),
+                            values = current_emb_qiery_sparse.values.tolist()
+                )
+
+            search_results = (await self.store.client.query_points(
+                                                collection_name = os.getenv("COLLECTION_NAME"),
+                                                prefetch = [
+                                                        Prefetch(query = emb_qiery, using ='dense',limit=20),      
+                                                        Prefetch(query = emb_qiery_sparse, using ='sparse',limit=20)],
+                                                query= RrfQuery(rrf=models.Rrf()),
+                                                limit = 30
+                                                )
+
+                            ).points
+            
+            if not search_results:
+                return "Информация не найдена"
+
+            docs = [f"---Документ: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for hit in search_results]
+
+            reranker_score_partial = partial(self.reranker.rerank,query,docs)
+            reranker_score = await loop.run_in_executor(None,reranker_score_partial)
+
+            if not isinstance(reranker_score,list):
+
+                reranker_score = [reranker_score]
+
+            if len(reranker_score) > 0 and reranker_score[0].score <= 0.35:
+
+                context_text = 'Не найдено релевантных ответов'
+
+            else:
+                context_text = "\n\n".join(node.text for node in reranker_score[:6])
 
 
-        emb_qiery = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
+            history_text = ""
+            if user_history:
+                history_text = "Предыдущий диалог:\n"
+                for turn in user_history[-5:]:  
+                    history_text += f"Пользователь: {turn['user']}\n"
+                    history_text += f"Ассистент: {turn['assistant']}\n"
+           
+            prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
 
-        emb_qiery_sparse_list = list(emb_qiery_sparse_raw)
-        current_emb_qiery_sparse = emb_qiery_sparse_list[0]
+                    ПРАВИЛА:
+                    1. Максимально полный ответ: используй ВСЮ информацию из контекста (все шаги, примечания, условия)
+                    2. При уточняющих вопросах ("почему?", "подробнее") используй ИСТОРИЮ ДИАЛОГА, но ответ строй по текущему КОНТЕКСТУ
+                    3. Работа с картинками: XML-теги <image_ref>...</image_ref> - копируй в ответ ТОЧНО на тех же местах
+                    4. Запрещены внешние знания. Если нет ответа: "Информация не найдена в базе знаний Axapta"
+                    5. В конце: "Источник: <название файла>"
 
-        emb_qiery_sparse = models.SparseVector(
-                        indices = current_emb_qiery_sparse.indices.tolist(),
-                        values = current_emb_qiery_sparse.values.tolist()
-            )
+                    КОНТЕКСТ ДЛЯ ОТВЕТА:
+                    {context_text}
 
-        search_results = (await self.store.client.query_points(
-                                            collection_name = os.getenv("COLLECTION_NAME"),
-                                            prefetch = [
-                                                    Prefetch(query = emb_qiery, using ='dense',limit=20),      
-                                                    Prefetch(query = emb_qiery_sparse, using ='sparse',limit=20)],
-                                            query= RrfQuery(rrf=models.Rrf()),
-                                            limit = 15
-                                            )
+                    ИСТОРИЯ ДИАЛОГА:
+                    {history_text}
 
-                        ).points
-        
-        if not search_results:
-            return "Информация не найдена"
-      
-        docs = [f"--- ФРАГМЕНТ №{i} ---\nДокумент: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for i, hit in enumerate(search_results, 1)]
-        context_text = "\n\n".join(docs)
+                    ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
 
+                    ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
 
-        history_text = ""
-        if user_history:
-            history_text = "Предыдущий диалог:\n"
-            for turn in user_history[-5:]:  
-                history_text += f"Пользователь: {turn['user']}\n"
-                history_text += f"Ассистент: {turn['assistant']}\n"
-       
-        prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
+            response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 14000})
 
-                ПРАВИЛА:
-                1. Максимально полный ответ: используй ВСЮ информацию из контекста (все шаги, примечания, условия)
-                2. При уточняющих вопросах ("почему?", "подробнее") используй ИСТОРИЮ ДИАЛОГА, но ответ строй по текущему КОНТЕКСТУ
-                3. Работа с картинками: XML-теги <image_ref>...</image_ref> - копируй в ответ ТОЧНО на тех же местах
-                4. Запрещены внешние знания. Если нет ответа: "Информация не найдена в базе знаний Axapta"
-                5. В конце: "Источник: <название файла>"
+            if user_id not in self.histories:
+                self.histories[user_id] = []
+            
+            self.histories[user_id].append({
+                'user': query,
+                'assistant': response["response"]
+            })
+            
+            self.histories[user_id] = self.histories[user_id][-4:]
 
-                КОНТЕКСТ ДЛЯ ОТВЕТА:
-                {context_text}
-
-                ИСТОРИЯ ДИАЛОГА:
-                {history_text}
-
-                ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
-
-                ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
-
-        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 14000})
-
-        if user_id not in self.histories:
-            self.histories[user_id] = []
-        
-        self.histories[user_id].append({
-            'user': query,
-            'assistant': response["response"]
-        })
-        
-        self.histories[user_id] = self.histories[user_id][-5:]
-
-        return response['response']
-        
+            return response['response']
+            
