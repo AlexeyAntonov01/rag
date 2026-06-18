@@ -333,7 +333,7 @@ class RagManager:
                 context_text = 'Не найдено релевантных ответов'
 
             else:
-                context_text = "\n\n".join(node.text for node in reranker_score[:6])
+                context_text = "\n\n".join(docs[node.index] for node in reranker_score[:6])
 
 
             history_text = ""
