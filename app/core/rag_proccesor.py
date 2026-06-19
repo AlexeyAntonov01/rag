@@ -54,8 +54,6 @@ class DocumentProcessor:
         if not os.path.exists(file_path):
             return
 
-        loop = asyncio.get_running_loop()
-
         def proccess_pdf():
 
             try:
@@ -105,7 +103,7 @@ class DocumentProcessor:
 
             return chunks, filename, result
 
-        return await loop.run_in_executor(None,proccess_pdf)
+        return await asyncio.to_thread(proccess_pdf)
     
 
 class VectorStore:
@@ -149,8 +147,6 @@ class VectorStore:
             chunk.text = text_fixed
             
         all_texts = [chunk.text for chunk in chunks]
-
-        loop = asyncio.get_running_loop()
         
         for i in range(0, len(all_texts), batch_size):
 
@@ -160,8 +156,8 @@ class VectorStore:
             encode_func = partial(self.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt=custom_prompt)
             encode_func_sparse = partial(self.sparse_emb_fn.encode,batch_texts)
 
-            batch_vectors = await loop.run_in_executor(None,encode_func)
-            batch_sparse_raw = await loop.run_in_executor(None,encode_func_sparse)
+            batch_vectors = await asyncio.to_thread(encode_func)
+            batch_sparse_raw = await asyncio.to_thread(encode_func_sparse)
             batch_sparse = list(batch_sparse_raw)
 
             for j, vector in enumerate(batch_vectors):
@@ -216,12 +212,48 @@ class VectorStore:
             raise  e
 
 
+class UserHistory:
+
+
+    def __init__(self):
+
+        self.turn = []
+        self.user_lock = asyncio.Lock()
+
+    def add_turn(self,query,response):
+
+        self.turn.append(
+                {
+                    'user':query,
+                    'assistant':response
+                }
+            )
+
+        self.turn = self.turn[-4:]
+
+    def clear_history(self):
+
+        self.turn.clear()
+
+    def get_text(self) -> str:
+
+        if not self.turn:
+            return ''
+
+        history_text = "Предыдущий диалог:\n"
+        for elem in self.turn[-4:]:
+
+            history_text += f"Пользователь: {elem['user']}\n"
+            history_text += f"Ассистент: {elem['assistant']}\n"
+
+        return history_text
+
+
 class RagManager:
 
    
     def __init__(self):
-       
-        self.histories = {}
+
         self.processor  = DocumentProcessor()
         self.store = VectorStore()
         self.ollama_host = os.getenv("OLLAMA_HOST")
@@ -229,7 +261,8 @@ class RagManager:
         self.semaphore = asyncio.Semaphore(1)
         self.emb_lock = asyncio.Lock()
         self.reranker = TextReranker(model_name='BAAI/bge-reranker-v2-m3',normalize=True)
-        self.user_lock = {}
+        self.histories = {}
+
 
     async def upload_file(self,file_path):
 
@@ -246,17 +279,16 @@ class RagManager:
 
     async def upload_file_multi(self,file_path_list:list):
 
-        #последовательно иначе oom
-        for file_nm in file_path_list:    
-            chunks,file_name,result = await self.processor.getDocument(file_nm)
-            full_text_markdown = result.document.export_to_markdown()
+        async with self.semaphore:
+            for file_nm in file_path_list:    
+                chunks,file_name,result = await self.processor.getDocument(file_nm)
+                full_text_markdown = result.document.export_to_markdown()
 
-            if chunks:
-                response_generated_topic = await self.generate_topic_prompt(full_text_markdown)
-                await self.store.chunks2Collection(chunks,file_name,response_generated_topic)
-            else:
-                print('Нет чанков!',flush=True)
-
+                if chunks:
+                    response_generated_topic = await self.generate_topic_prompt(full_text_markdown)
+                    await self.store.chunks2Collection(chunks,file_name,response_generated_topic)
+                else:
+                    print('Нет чанков!',flush=True)
 
     async def generate_topic_prompt(self,full_text_markdown):
 
@@ -269,35 +301,32 @@ class RagManager:
 
         return response_generated_topic['response']
 
-
-    def clearHistory(self,user_id):
-
-        self.histories.pop(user_id,None)
-
-
     async def ask(self, query,user_id=0):
 
-        if user_id not in self.user_lock:
+      
+        if user_id not in self.histories:
 
-            self.user_lock[user_id] = asyncio.Lock()
+            self.histories[user_id] = UserHistory()
 
-        async with self.user_lock[user_id]:
+        # Лок для пользователя, чтобы не ломалось история и небыло конкурентных запросов. 
+        async with self.histories[user_id].user_lock:
 
-            user_history = self.histories.get(user_id, [])
-            loop = asyncio.get_running_loop()
             emb_qiery_func = partial(self.store.emb_fn.encode,query)
             emb_qiery_sparse_func = partial(self.store.sparse_emb_fn.encode,[query])
 
-            async with self.emb_lock:
-                emb_qiery_raw_task =  loop.run_in_executor(
-                    None,
-                    emb_qiery_func
-                )
-                emb_qiery_sparse_raw_task =  loop.run_in_executor(
-                    None,
+            ## Потенциально узкое место, модель эмбеддингов для плотных вектора не потокобезопасна
+            ## Пришлось обернуть в асинхронный лок
+
+            emb_qiery_sparse_raw_task =  asyncio.to_thread(
                     emb_qiery_sparse_func
                     )
-            emb_qiery_raw,emb_qiery_sparse_raw = await asyncio.gather(emb_qiery_raw_task,emb_qiery_sparse_raw_task)
+
+            async with self.emb_lock:
+                emb_qiery_raw =  await asyncio.to_thread(
+                    emb_qiery_func
+                )
+
+            emb_qiery_sparse_raw = await emb_qiery_sparse_raw_task
 
             emb_qiery = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
 
@@ -326,7 +355,7 @@ class RagManager:
             docs = [f"---Документ: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for hit in search_results]
 
             reranker_score_partial = partial(self.reranker.rerank,query,docs)
-            reranker_score = list(await loop.run_in_executor(None,reranker_score_partial))
+            reranker_score = list(await asyncio.to_thread(reranker_score_partial))
 
             if len(reranker_score) > 0 and reranker_score[0].score <= 0.35:
 
@@ -336,12 +365,7 @@ class RagManager:
                 context_text = "\n\n".join(docs[node.index] for node in reranker_score[:6])
 
 
-            history_text = ""
-            if user_history:
-                history_text = "Предыдущий диалог:\n"
-                for turn in user_history[-5:]:  
-                    history_text += f"Пользователь: {turn['user']}\n"
-                    history_text += f"Ассистент: {turn['assistant']}\n"
+            history_text = self.histories[user_id].get_text()
            
             prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
 
@@ -364,15 +388,7 @@ class RagManager:
 
             response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 14000})
 
-            if user_id not in self.histories:
-                self.histories[user_id] = []
-            
-            self.histories[user_id].append({
-                'user': query,
-                'assistant': response["response"]
-            })
-            
-            self.histories[user_id] = self.histories[user_id][-4:]
+            self.histories[user_id].add_turn(query,response['response'])
 
             return response['response']
             
