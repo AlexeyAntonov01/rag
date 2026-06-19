@@ -317,10 +317,10 @@ class RagManager:
             ## Потенциально узкое место, модель эмбеддингов для плотных вектора не потокобезопасна
             ## Пришлось обернуть в асинхронный лок
 
-            emb_qiery_sparse_raw_task =  asyncio.to_thread(
+            emb_qiery_sparse_raw_task =  asyncio.create_task(asyncio.to_thread(
                     emb_qiery_sparse_func
                     )
-
+                )
             async with self.emb_lock:
                 emb_qiery_raw =  await asyncio.to_thread(
                     emb_qiery_func
