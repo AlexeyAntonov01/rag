@@ -26,12 +26,15 @@ import pymupdf
 import hashlib
 from functools import partial
 import re
+from loguru import logger
 
 
 class DocumentProcessor:
     # Принять документ -> Вернуть чанки с методанными
 
     def __init__(self):
+
+        logger.info('Инициализация объекта DocumentProcessor')
 
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = False
@@ -88,6 +91,7 @@ class DocumentProcessor:
                                                 color = (1,0,0))
                                 
                         except Exception as page_error:
+                            logger.error(f'Ошибка при разборе картинки на {num}:{page_error}')
                             print(f'Ошибка при разборе картинки на {num}:{page_error}')
                             continue
 
@@ -95,8 +99,9 @@ class DocumentProcessor:
                     
 
             except Exception as e:
-
+                logger.critical(f"Критическая ошибка при работе с файлом {filename}: {e}")
                 print(f"Критическая ошибка при работе с файлом {filename}: {e}")
+                raise e
 
             result = self.docs_converter.convert(temp_pdf_path)
             chunks = list(self.chunker.chunk(result.document))
@@ -110,10 +115,12 @@ class VectorStore:
     # Превращает чанки в векторы -> Insert в БД
     def __init__(self):
 
+        logger.info('Инициализация объекта VectorStore')
+
         self.collection_name = os.getenv("COLLECTION_NAME")
         self.qdrant_host = os.getenv("QDRANT_HOST")
         self.client = AsyncQdrantClient(host = self.qdrant_host,port=int(os.getenv("QDRANT_PORT")))
-        self.sparse_emb_fn = SparseTextEmbedding(model_name="Qdrant/bm25")
+        self.sparse_emb_fn = SparseTextEmbedding(model_name="Qdrant/bm25", cache_dir="/root/.cache/huggingface")
        
         self.emb_fn = SentenceTransformer(
             os.getenv("EMBED_MODEL"),
@@ -156,8 +163,14 @@ class VectorStore:
             encode_func = partial(self.emb_fn.encode, batch_texts,convert_to_tensor=False,prompt=custom_prompt)
             encode_func_sparse = partial(self.sparse_emb_fn.encode,batch_texts)
 
+            logger.info('Получение векторов с помощью моделей эмбеддингов')
+
             batch_vectors = await asyncio.to_thread(encode_func)
+            logger.info(f'Успешное получение векторов с помощью моделей эмбеддингов {os.getenv("EMBED_MODEL")}')
+
             batch_sparse_raw = await asyncio.to_thread(encode_func_sparse)
+            logger.info(f'Успешное получение векторов с помощью моделей эмбеддингов Qdrant/bm25')
+
             batch_sparse = list(batch_sparse_raw)
 
             for j, vector in enumerate(batch_vectors):
@@ -173,42 +186,54 @@ class VectorStore:
                         indices = current_sparse.indices.tolist(),
                         values = current_sparse.values.tolist()
                     )
-
-                points.append(
-                    PointStruct(
-                        id=stable_id,
-                        vector=
-                            {
-                                'dense' :vector.tolist(),
-                                'sparse':vector_sparse
+                try:
+                    points.append(
+                        PointStruct(
+                            id=stable_id,
+                            vector=
+                                {
+                                    'dense' :vector.tolist(),
+                                    'sparse':vector_sparse
+                                }
+                            ,
+                            payload={
+                                'text': chunk.text,
+                                'metadatas': {
+                                    'filename': file_name,
+                                    'title': response_generated_topic if response_generated_topic else 'Неизвестно'
+                                }
                             }
-                        ,
-                        payload={
-                            'text': chunk.text,
-                            'metadatas': {
-                                'filename': file_name,
-                                'title': response_generated_topic if response_generated_topic else 'Неизвестно'
-                            }
-                        }
+                        )
                     )
-                )
+
+                    logger.info(f'Успешное добавление данных в список: объект PointStruct')
+
+                except Exception as e:
+                    logger.critical(f'Критическая ошибка. Ошибка при добавлении данных в объект PointStruct {e}')
+                    raise e
         
         await self.client.upsert(collection_name=self.collection_name, points=points)
+
+        logger.info(f'Успешное добавление точек в БД: список объектов PointStruct')
 
 
     async def clear_db(self):
 
         try:
             await self.client.delete_collection(self.collection_name)
+            logger.info(f'Коллекция БД успешно удалена!')
+
             await self.client.create_collection(
                         collection_name=self.collection_name,
                         vectors_config = {'dense': VectorParams(size=768,distance=Distance.COSINE)},
                         sparse_vectors_config = {'sparse':SparseVectorParams()}
             )
+            logger.info(f'Пустая коллекция БД успешно создана!')
 
             return True
 
         except Exception as e:
+            logger.critical(f'Критическая оишбка при удалении колекции: {e}')
             raise  e
 
 
@@ -216,6 +241,8 @@ class UserHistory:
 
 
     def __init__(self):
+
+        logger.info('Инициализация объекта UserHistory')
 
         self.turn = []
         self.user_lock = asyncio.Lock()
@@ -254,41 +281,55 @@ class RagManager:
    
     def __init__(self):
 
+        logger.info('Инициализация объекта RagManager')
+
         self.processor  = DocumentProcessor()
         self.store = VectorStore()
         self.ollama_host = os.getenv("OLLAMA_HOST")
         self.client = AsyncClient(host=self.ollama_host)
         self.semaphore = asyncio.Semaphore(1)
         self.emb_lock = asyncio.Lock()
-        self.reranker = TextReranker(model_name='BAAI/bge-reranker-v2-m3',normalize=True)
+
+        logger.info('Загрузка модели реранкера BAAI/bge-reranker-v2-m3 (это может занять время при первом запуске)')
+
+        self.reranker = TextReranker(model_name='BAAI/bge-reranker-v2-m3',normalize=True,cache_dir="/root/.cache/huggingface")
         self.histories = {}
 
+        logger.info('RagManager успешно создан')
 
     async def upload_file(self,file_path):
 
+        logger.info('Загрузка единичего файла.')
+
         async with self.semaphore:
             chunks,file_name,result = await self.processor.getDocument(file_path)
-
+            logger.info(f'Файл {file_name} успешно распарсился')
             full_text_markdown = result.document.export_to_markdown()
 
             if chunks:
                 response_generated_topic = await self.generate_topic_prompt(full_text_markdown)
+                logger.info(f'Загрузка файла {file_name} в БД')
                 await self.store.chunks2Collection(chunks,file_name,response_generated_topic)
             else:
-                print('Нет чанков!',flush=True)
+                logger.warning(f'Нет чанков! {file_name}')
+        
 
     async def upload_file_multi(self,file_path_list:list):
+
+        logger.info('Загрузка файлов из каталога.')
 
         async with self.semaphore:
             for file_nm in file_path_list:    
                 chunks,file_name,result = await self.processor.getDocument(file_nm)
+                logger.info(f'Файл {file_name} успешно распарсился')
                 full_text_markdown = result.document.export_to_markdown()
 
                 if chunks:
                     response_generated_topic = await self.generate_topic_prompt(full_text_markdown)
+                    logger.info(f'Загрузка файла {file_name} в БД')
                     await self.store.chunks2Collection(chunks,file_name,response_generated_topic)
                 else:
-                    print('Нет чанков!',flush=True)
+                    logger.warning(f'Нет чанков! {file_name}')
 
     async def generate_topic_prompt(self,full_text_markdown):
 
@@ -297,9 +338,21 @@ class RagManager:
                 Текст документа:
                 {full_text_markdown}
             """
-        response_generated_topic = await self.client.generate(model='qwen2.5:7b', prompt=topic_prompt)
+        logger.info('Генерация топика документа')
+
+        try:
+            response_generated_topic = await self.client.generate(model='qwen2.5:7b', prompt=topic_prompt)
+
+        except Exception as e:
+
+            logger.critical(f'Критическая ошибка генерации топика документа, НЕОБХОДИМО ПЕРЕЗАЛИТЬ ФАЙЛ: {e}')
+
+            return ''
+
+        logger.info('Генерация топика документа успешно выполнена')
 
         return response_generated_topic['response']
+
 
     async def ask(self, query,user_id=0):
 
@@ -311,84 +364,157 @@ class RagManager:
         # Лок для пользователя, чтобы не ломалось история и небыло конкурентных запросов. 
         async with self.histories[user_id].user_lock:
 
-            emb_qiery_func = partial(self.store.emb_fn.encode,query)
-            emb_qiery_sparse_func = partial(self.store.sparse_emb_fn.encode,[query])
+            logger.info('Получение плотных и разряженых векторов')
 
-            ## Потенциально узкое место, модель эмбеддингов для плотных вектора не потокобезопасна
-            ## Пришлось обернуть в асинхронный лок
+            try:
+                dense_vector,sparse_vector  = await self._get_embeddings(query)
 
-            emb_qiery_sparse_raw_task =  asyncio.create_task(asyncio.to_thread(
-                    emb_qiery_sparse_func
-                    )
-                )
-            async with self.emb_lock:
-                emb_qiery_raw =  await asyncio.to_thread(
-                    emb_qiery_func
-                )
+            except Exception as e:
 
-            emb_qiery_sparse_raw = await emb_qiery_sparse_raw_task
+                logger.critical(f' ОШИБКА при получение плотных и разряженых векторов!!! {e}')
 
-            emb_qiery = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
+                raise e
 
-            emb_qiery_sparse_list = list(emb_qiery_sparse_raw)
-            current_emb_qiery_sparse = emb_qiery_sparse_list[0]
+            logger.info('Поиск результатов по векторам в БД')
 
-            emb_qiery_sparse = models.SparseVector(
-                            indices = current_emb_qiery_sparse.indices.tolist(),
-                            values = current_emb_qiery_sparse.values.tolist()
-                )
+            try:
+                search_results = await self._search_database(dense_vector,sparse_vector)
 
-            search_results = (await self.store.client.query_points(
-                                                collection_name = os.getenv("COLLECTION_NAME"),
-                                                prefetch = [
-                                                        Prefetch(query = emb_qiery, using ='dense',limit=20),      
-                                                        Prefetch(query = emb_qiery_sparse, using ='sparse',limit=20)],
-                                                query= RrfQuery(rrf=models.Rrf()),
-                                                limit = 30
-                                                )
+            except Exception as e:
 
-                            ).points
-            
+                logger.critical(f' ОШИБКА при поиски данных в БД!!! {e}')
+
+                raise e
+
+
             if not search_results:
                 return "Информация не найдена"
+            
+            docs = self._prepear_context(search_results)
 
-            docs = [f"---Документ: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for hit in search_results]
+            logger.info('Запуск реранкера')
 
-            reranker_score_partial = partial(self.reranker.rerank,query,docs)
-            reranker_score = list(await asyncio.to_thread(reranker_score_partial))
+            try:
 
-            if len(reranker_score) > 0 and reranker_score[0].score <= 0.35:
+                context = await self._reranker_score(query,docs)
 
-                context_text = 'Не найдено релевантных ответов'
+            except Exception as e:
 
-            else:
-                context_text = "\n\n".join(docs[node.index] for node in reranker_score[:6])
+                logger.critical(f' ОШИБКА при выполнении функции реранкера!!! {e}')
 
+                raise e
 
             history_text = self.histories[user_id].get_text()
-           
-            prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
 
-                    ПРАВИЛА:
-                    1. Максимально полный ответ: используй ВСЮ информацию из контекста (все шаги, примечания, условия)
-                    2. При уточняющих вопросах ("почему?", "подробнее") используй ИСТОРИЮ ДИАЛОГА, но ответ строй по текущему КОНТЕКСТУ
-                    3. Работа с картинками: XML-теги <image_ref>...</image_ref> - копируй в ответ ТОЧНО на тех же местах
-                    4. Запрещены внешние знания. Если нет ответа: "Информация не найдена в базе знаний Axapta"
-                    5. В конце: "Источник: <название файла>"
+            logger.info(
+                    "\n"
+                    "==================== ПЕРЕДАЧА ДАННЫХ В LLM ====================\n"
+                    f" [ВОПРОС]: {query}\n"
+                    "---------------------------------------------------------------\n"
+                    f" [ИСТОРИЯ ДИАЛОГА]:\n{history_text or 'История пуста'}\n"
+                    "---------------------------------------------------------------\n"
+                    f" [НАЙДЕННЫЙ КОНТЕКСТ]:\n{context}\n"
+                    "==============================================================="
+                )
+            try:
 
-                    КОНТЕКСТ ДЛЯ ОТВЕТА:
-                    {context_text}
+                response = await self._generate_llm_response(context,history_text,query)
 
-                    ИСТОРИЯ ДИАЛОГА:
-                    {history_text}
+            except Exception as e:
 
-                    ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
+                logger.critical(f' ОШИБКА при работе с llm!!! {e}')
 
-                    ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
+                raise e
 
-            response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 14000})
+            self.histories[user_id].add_turn(query,response)
 
-            self.histories[user_id].add_turn(query,response['response'])
+            return response
 
-            return response['response']
+
+    async def _get_embeddings(self,query):
+
+        ## Потенциально узкое место, модель эмбеддингов для плотных вектора не потокобезопасна
+        ## Пришлось обернуть в асинхронный лок
+
+        emb_qiery_sparse_raw_task =  asyncio.create_task(asyncio.to_thread(
+                self.store.sparse_emb_fn.encode,[query]
+                )
+            )
+        async with self.emb_lock:
+            emb_qiery_raw =  await asyncio.to_thread(
+                self.store.emb_fn.encode,query
+            )
+
+        emb_qiery_sparse_raw = await emb_qiery_sparse_raw_task
+
+        emb_qiery_dense = emb_qiery_raw.tolist() if hasattr(emb_qiery_raw, 'tolist') else list(emb_qiery_raw)
+
+        emb_qiery_sparse_list = list(emb_qiery_sparse_raw)
+        current_emb_qiery_sparse = emb_qiery_sparse_list[0]
+
+        emb_qiery_sparse = models.SparseVector(
+                        indices = current_emb_qiery_sparse.indices.tolist(),
+                        values = current_emb_qiery_sparse.values.tolist()
+            )
+
+
+        return emb_qiery_dense, emb_qiery_sparse
+
+
+    async def _search_database(self,dense_vector,sparse_vector):
+
+        search_results = (await self.store.client.query_points(
+                                            collection_name = os.getenv("COLLECTION_NAME"),
+                                            prefetch = [
+                                                    Prefetch(query = dense_vector, using ='dense',limit=20),      
+                                                    Prefetch(query = sparse_vector, using ='sparse',limit=20)],
+                                            query= RrfQuery(rrf=models.Rrf()),
+                                            limit = 30
+                                            )
+
+                        ).points
+
+        return search_results
+
+    def _prepear_context(self,search_results):
+
+        docs = [f"---Документ: {hit.payload['metadatas']['filename']}\nКраткое описание документа: {hit.payload['metadatas']['title']}\nТекст: {hit.payload['text']}" for hit in search_results]
+
+        return docs
+
+    async def _reranker_score(self,query,docs):
+
+        reranker_score = list(await asyncio.to_thread(self.reranker.rerank,query,docs))
+
+        if not reranker_score or reranker_score[0].score <= 0.35:
+            context_text = 'Не найдено релевантных ответов'
+        else:
+            context_text = "\n\n".join(docs[node.index] for node in reranker_score[:6])
+
+        return context_text
+
+    async def _generate_llm_response(self,context,history_text,query):
+
+        prompt = f"""Ты - ассистент технической поддержки Axapta. Твоя единственная задача - дать точный, структурированный ответ на вопрос пользователя, опираясь исключительно на предоставленный КОНТЕКСТ.
+
+                ПРАВИЛА:
+                1. Максимально полный ответ: используй ВСЮ информацию из контекста (все шаги, примечания, условия)
+                2. При уточняющих вопросах ("почему?", "подробнее") используй ИСТОРИЮ ДИАЛОГА, но ответ строй по текущему КОНТЕКСТУ
+                3. Работа с картинками: XML-теги <image_ref>...</image_ref> - копируй в ответ ТОЧНО на тех же местах
+                4. Запрещены внешние знания. Если нет ответа: "Информация не найдена в базе знаний Axapta"
+                5. В конце: "Источник: <название файла>"
+
+                КОНТЕКСТ ДЛЯ ОТВЕТА:
+                {context}
+
+                ИСТОРИЯ ДИАЛОГА:
+                {history_text}
+
+                ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
+
+                ПОШАГОВЫЙ ОТВЕТ АССИСТЕНТА:"""
+
+        response = await self.client.generate(model="qwen2.5:7b", prompt=prompt, options={'temperature': 0, "num_ctx": 14000})
+
+        return response['response']
             
