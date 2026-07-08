@@ -121,7 +121,7 @@ class DocumentProcessor:
 
                 filename = os.path.basename(file_path)
                 temp_docx_path = f"data/temp_no_images_{filename}"
-
+                images_folder = "data/output_images/" 
                 doc = docx.Document(docx=file_path)
                 images_by_id = doc.part.related_parts
 
@@ -149,10 +149,10 @@ class DocumentProcessor:
                                 ext = img_part .content_type.split('/')[-1]
                                 if ext == 'x-png': ext = 'png'
 
-                                img_path = f"{folder_path}{rId}.{ext}"
+                                img_path = f"{images_folder}{rId}.{ext}"
 
-                                img_hash = hashlib.md5(img_part .blob).hexdigest()
-                                unique_filename_to_save = f"{folder_path}{img_hash}.{ext}"
+                                img_hash = hashlib.md5(img_part.blob).hexdigest()
+                                unique_filename_to_save = f"{images_folder}{img_hash}.{ext}"
 
                                 with open(unique_filename_to_save, 'wb') as f:
 
@@ -165,7 +165,7 @@ class DocumentProcessor:
                                 new_run.font.color.rgb = RGBColor(255, 0, 0)
 
 
-                output_file_path = file_path.replace('.docx', '_clean_with_tags.docx')
+                output_file_path = temp_docx_path.replace('.docx', '_clean_with_tags.docx')
                 doc.save(output_file_path)
 
             except Exception as e:
@@ -174,19 +174,19 @@ class DocumentProcessor:
                 print(f"Критическая ошибка при работе с файлом {filename}: {e}")
                 raise e
 
-            result = self.docs_converter.convert(temp_docx_path)
+            result = self.docs_converter.convert(output_file_path)
             chunks = list(self.chunker.chunk(result.document))
 
             return chunks, filename, result
 
         match file_ext:
-            case: ".docx":
+            case ".docx":
                 return await asyncio.to_thread(proccess_docx)
 
-            case: ".pdf"
+            case ".pdf":
                 return await asyncio.to_thread(proccess_pdf)
 
-            case: _:
+            case _:
             
                 return "Формат файла не поддерживается"    
 
