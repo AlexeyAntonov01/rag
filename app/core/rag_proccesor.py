@@ -27,6 +27,8 @@ import hashlib
 from functools import partial
 import re
 from loguru import logger
+import docx
+from docx.shared import RGBColor
 
 
 class DocumentProcessor:
@@ -43,6 +45,7 @@ class DocumentProcessor:
         pdf_options = PdfFormatOption(pipeline_options=pipeline_options)
 
         self.docs_converter = DocumentConverter(
+            allowed_formats=[InputFormat.PDF, InputFormat.DOCX],
             format_options={
                 InputFormat.PDF: pdf_options
             }
@@ -56,6 +59,10 @@ class DocumentProcessor:
 
         if not os.path.exists(file_path):
             return
+
+        path = Path(file_path)
+
+        file_ext = path.suffix.lower()
 
         def proccess_pdf():
 
@@ -108,8 +115,82 @@ class DocumentProcessor:
 
             return chunks, filename, result
 
-        return await asyncio.to_thread(proccess_pdf)
-    
+        def proccess_docx():
+
+            try:
+
+                filename = os.path.basename(file_path)
+                temp_docx_path = f"data/temp_no_images_{filename}"
+
+                doc = docx.Document(docx=file_path)
+                images_by_id = doc.part.related_parts
+
+                for paragraph in doc.paragraphs:
+
+                    p_element = paragraph._p
+
+                    drawing = p_element.xpath('.//w:drawing')
+
+
+                    if drawing:
+
+                        drawing_obj = drawing[0]
+
+                        rId_list = drawing_obj.xpath('.//a:blip/@r:embed')
+
+                        if rId_list:
+
+                            rId = rId_list[0]
+
+                            if rId in images_by_id:
+
+                                img_part  = images_by_id[rId]
+
+                                ext = img_part .content_type.split('/')[-1]
+                                if ext == 'x-png': ext = 'png'
+
+                                img_path = f"{folder_path}{rId}.{ext}"
+
+                                img_hash = hashlib.md5(img_part .blob).hexdigest()
+                                unique_filename_to_save = f"{folder_path}{img_hash}.{ext}"
+
+                                with open(unique_filename_to_save, 'wb') as f:
+
+                                    f.write(img_part.blob)
+
+                                logger.info(f"Успешно сохранена картинка: {rId}.{ext}")
+
+                                drawing_obj.getparent().remove(drawing_obj)
+                                new_run = paragraph.add_run(f'<image_ref>{img_hash}</image_ref>')
+                                new_run.font.color.rgb = RGBColor(255, 0, 0)
+
+
+                output_file_path = file_path.replace('.docx', '_clean_with_tags.docx')
+                doc.save(output_file_path)
+
+            except Exception as e:
+
+                logger.critical(f"Критическая ошибка при работе с файлом {filename}: {e}")
+                print(f"Критическая ошибка при работе с файлом {filename}: {e}")
+                raise e
+
+            result = self.docs_converter.convert(temp_docx_path)
+            chunks = list(self.chunker.chunk(result.document))
+
+            return chunks, filename, result
+
+        match file_ext:
+            case: ".docx":
+                return await asyncio.to_thread(proccess_docx)
+
+            case: ".pdf"
+                return await asyncio.to_thread(proccess_pdf)
+
+            case: _:
+            
+                return "Формат файла не поддерживается"    
+
+
 
 class VectorStore:
     # Превращает чанки в векторы -> Insert в БД
