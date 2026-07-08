@@ -29,6 +29,7 @@ import re
 from loguru import logger
 import docx
 from docx.shared import RGBColor
+from docx.shared import Cm
 
 
 class DocumentProcessor:
@@ -163,7 +164,12 @@ class DocumentProcessor:
                                 drawing_obj.getparent().remove(drawing_obj)
                                 new_run = paragraph.add_run(f'<image_ref>{img_hash}</image_ref>')
                                 new_run.font.color.rgb = RGBColor(255, 0, 0)
-
+                
+                for section in doc.sections:
+                    section.top_margin = Cm(1.27)     
+                    section.bottom_margin = Cm(1.27)  
+                    section.left_margin = Cm(1.27)    
+                    section.right_margin = Cm(1.27)   
 
                 output_file_path = temp_docx_path.replace('.docx', '_clean_with_tags.docx')
                 doc.save(output_file_path)
